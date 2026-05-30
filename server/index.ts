@@ -73,11 +73,30 @@ type ErrorCode = 'CONFIG_MISSING' | 'UPSTREAM_ERROR' | 'UPSTREAM_TIMEOUT' | 'NO_
 
 type RequestLogger = (stage: string, details?: Record<string, unknown>) => void;
 
+type MatchJobStatus = 'pending' | 'running' | 'success' | 'failed';
+
+type MatchJob = {
+  id: string;
+  status: MatchJobStatus;
+  createdAt: number;
+  updatedAt: number;
+  concernPreview: string;
+  crisisDetected: boolean;
+  story?: z.infer<typeof StoryResultSchema>;
+  error?: {
+    message: string;
+    code: ErrorCode;
+    status: number;
+  };
+};
+
 const crisisPattern = /(自杀|轻生|不想活|结束生命|伤害自己|自残|活不下去|suicide|kill myself|self-harm)/i;
 const reliableMinimum = 2;
 const AI_TIMEOUT_MS = 12000;
 const TAVILY_TIMEOUT_MS = 10000;
 const MATCH_SOURCE_LIMIT = 8;
+const JOB_TTL_MS = 30 * 60 * 1000;
+const jobs = new Map<string, MatchJob>();
 
 const famousSeedLibrary: Record<string, string[]> = {
   job_rejection: ['J.K. Rowling', 'Steve Jobs', 'Oprah Winfrey', 'Walt Disney', 'Abraham Lincoln', '俞敏洪', '马云', '李安'],
@@ -114,72 +133,26 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.post('/api/match-story', async (req, res) => {
-  const requestId = randomUUID();
-  const startedAt = Date.now();
-  const log = createRequestLogger(requestId);
+  const jobId = randomUUID();
+  const log = createRequestLogger(jobId);
 
   const parsed = MatchRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     const error = parsed.error.issues[0]?.message ?? '输入内容无效。';
     log('bad_request', { error });
-    res.status(400).json({ error, code: 'BAD_REQUEST' satisfies ErrorCode, requestId });
+    res.status(400).json({ error, code: 'BAD_REQUEST' satisfies ErrorCode, requestId: jobId });
     return;
   }
 
   const concern = parsed.data.concern;
   const recentPeople = parsed.data.recentPeople;
   const crisisDetected = crisisPattern.test(concern);
-  log('start', { concernLength: concern.length, recentPeopleCount: recentPeople.length, crisisDetected });
 
   try {
-    log('env_check');
     assertEnv();
-
-    log('analysis_start');
-    const analysis = await analyzeConcernForSearch(concern, log);
-    log('analysis_done', { caseType: analysis.caseType, candidates: analysis.famousCandidates.length });
-
-    log('search_start');
-    const searchResults = await searchPublicStories(concern, analysis);
-    log('search_done', { results: searchResults.length });
-
-    const rankedResults = rankSearchResults(searchResults, analysis, recentPeople).slice(0, 12);
-    log('rank_done', { rankedResults: rankedResults.length });
-
-    const reliableResults = await evaluateCandidatesWithAi(concern, analysis, rankedResults, log);
-    log('evaluation_done', { reliableResults: reliableResults.length });
-
-    if (reliableResults.length < reliableMinimum) {
-      log('no_reliable_source', { reliableResults: reliableResults.length });
-      res.status(424).json({
-        error: '暂时没有找到足够可靠的原文材料。',
-        code: 'NO_RELIABLE_SOURCE' satisfies ErrorCode,
-        requestId,
-        crisisDetected
-      });
-      return;
-    }
-
-    log('quote_match_start');
-    const story = await findVerifiedQuote(concern, reliableResults.slice(0, MATCH_SOURCE_LIMIT), analysis, log);
-
-    if (!story) {
-      log('quote_match_failed');
-      res.status(424).json({
-        error: '暂时没有找到足够可靠的原文材料。',
-        code: 'NO_RELIABLE_SOURCE' satisfies ErrorCode,
-        requestId,
-        crisisDetected
-      });
-      return;
-    }
-
-    log('success', { elapsedMs: Date.now() - startedAt, sourceUrl: story.sourceUrl });
-    res.json({ story, crisisDetected, requestId });
   } catch (error) {
     const publicError = getPublicError(error);
-    log('failed', {
-      elapsedMs: Date.now() - startedAt,
+    log('job_rejected', {
       code: publicError.code,
       status: publicError.status,
       message: error instanceof Error ? error.message : String(error)
@@ -187,10 +160,72 @@ app.post('/api/match-story', async (req, res) => {
     res.status(publicError.status).json({
       error: publicError.message,
       code: publicError.code,
-      requestId,
+      requestId: jobId,
       crisisDetected
     });
+    return;
   }
+
+  cleanupJobs();
+
+  const job: MatchJob = {
+    id: jobId,
+    status: 'pending',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    concernPreview: concern.slice(0, 80),
+    crisisDetected
+  };
+  jobs.set(jobId, job);
+
+  log('job_created', { concernLength: concern.length, recentPeopleCount: recentPeople.length, crisisDetected });
+  res.status(202).json({ jobId, status: job.status, requestId: jobId, crisisDetected });
+
+  void runMatchJob(jobId, concern, recentPeople);
+});
+
+app.get('/api/match-story/:jobId', (req, res) => {
+  cleanupJobs();
+
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    res.status(404).json({
+      error: '匹配任务不存在或已过期，请重新提交。',
+      code: 'BAD_REQUEST' satisfies ErrorCode,
+      requestId: req.params.jobId
+    });
+    return;
+  }
+
+  if (job.status === 'success' && job.story) {
+    res.json({
+      jobId: job.id,
+      status: job.status,
+      story: job.story,
+      crisisDetected: job.crisisDetected,
+      requestId: job.id
+    });
+    return;
+  }
+
+  if (job.status === 'failed' && job.error) {
+    res.status(job.error.status).json({
+      jobId: job.id,
+      status: job.status,
+      error: job.error.message,
+      code: job.error.code,
+      crisisDetected: job.crisisDetected,
+      requestId: job.id
+    });
+    return;
+  }
+
+  res.json({
+    jobId: job.id,
+    status: job.status,
+    crisisDetected: job.crisisDetected,
+    requestId: job.id
+  });
 });
 
 if (isProduction) {
@@ -203,6 +238,82 @@ if (isProduction) {
 app.listen(PORT, () => {
   console.log(`Story matcher API listening on http://localhost:${PORT}`);
 });
+
+async function runMatchJob(jobId: string, concern: string, recentPeople: string[]) {
+  const job = jobs.get(jobId);
+  if (!job) {
+    return;
+  }
+
+  const startedAt = Date.now();
+  const log = createRequestLogger(jobId);
+  job.status = 'running';
+  job.updatedAt = Date.now();
+  log('job_running', { concernLength: concern.length, recentPeopleCount: recentPeople.length, crisisDetected: job.crisisDetected });
+
+  try {
+    const story = await matchStoryStrictly(concern, recentPeople, log);
+    job.status = 'success';
+    job.story = story;
+    job.updatedAt = Date.now();
+    log('job_success', { elapsedMs: Date.now() - startedAt, sourceUrl: story.sourceUrl });
+  } catch (error) {
+    const publicError = getPublicError(error);
+    job.status = 'failed';
+    job.error = {
+      message: publicError.message,
+      code: publicError.code,
+      status: publicError.status
+    };
+    job.updatedAt = Date.now();
+    log('job_failed', {
+      elapsedMs: Date.now() - startedAt,
+      code: publicError.code,
+      status: publicError.status,
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+async function matchStoryStrictly(concern: string, recentPeople: string[], log: RequestLogger) {
+  log('analysis_start');
+  const analysis = await analyzeConcernForSearch(concern, log);
+  log('analysis_done', { caseType: analysis.caseType, candidates: analysis.famousCandidates.length });
+
+  log('search_start');
+  const searchResults = await searchPublicStories(concern, analysis);
+  log('search_done', { results: searchResults.length });
+
+  const rankedResults = rankSearchResults(searchResults, analysis, recentPeople).slice(0, 12);
+  log('rank_done', { rankedResults: rankedResults.length });
+
+  const reliableResults = await evaluateCandidatesWithAi(concern, analysis, rankedResults, log);
+  log('evaluation_done', { reliableResults: reliableResults.length });
+
+  if (reliableResults.length < reliableMinimum) {
+    log('no_reliable_source', { reliableResults: reliableResults.length });
+    throw new AppError('NO_RELIABLE_SOURCE', 424, '暂时没有找到足够可靠的原文材料。');
+  }
+
+  log('quote_match_start');
+  const story = await findVerifiedQuote(concern, reliableResults.slice(0, MATCH_SOURCE_LIMIT), analysis, log);
+
+  if (!story) {
+    log('quote_match_failed');
+    throw new AppError('NO_RELIABLE_SOURCE', 424, '暂时没有找到足够可靠的原文材料。');
+  }
+
+  return story;
+}
+
+function cleanupJobs() {
+  const expiresBefore = Date.now() - JOB_TTL_MS;
+  for (const [jobId, job] of jobs) {
+    if (job.updatedAt < expiresBefore) {
+      jobs.delete(jobId);
+    }
+  }
+}
 
 class AppError extends Error {
   readonly code: ErrorCode;
