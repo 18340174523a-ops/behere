@@ -15,6 +15,16 @@ type StoryResult = {
 type MatchResponse = {
   story: StoryResult;
   crisisDetected: boolean;
+  requestId?: string;
+};
+
+type ApiErrorCode = 'CONFIG_MISSING' | 'UPSTREAM_ERROR' | 'UPSTREAM_TIMEOUT' | 'NO_RELIABLE_SOURCE' | 'BAD_REQUEST';
+
+type ApiErrorResponse = {
+  error?: string;
+  code?: ApiErrorCode;
+  requestId?: string;
+  crisisDetected?: boolean;
 };
 
 type HistoryItem = {
@@ -26,6 +36,7 @@ type HistoryItem = {
 
 const HISTORY_KEY = 'resonant-stories-history';
 const EXAMPLE_TEXT = '最近我觉得自己很努力却一直没有进展，看到别人都往前走，我开始怀疑是不是自己根本不适合现在做的事。';
+const MATCH_TIMEOUT_MS = 35000;
 
 function App() {
   const [concern, setConcern] = React.useState('');
@@ -37,6 +48,10 @@ function App() {
 
   async function submitConcern(event: React.FormEvent) {
     event.preventDefault();
+    if (loading) {
+      return;
+    }
+
     const trimmed = concern.trim();
     if (trimmed.length < 12) {
       setError('请多写一点你的处境，至少 12 个字。');
@@ -49,22 +64,11 @@ function App() {
     setCrisisDetected(false);
 
     try {
-      const response = await fetch('/api/match-story', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          concern: trimmed,
-          recentPeople: history.map((item) => item.story.personName).slice(0, 8)
-        })
+      const data = await requestMatchStory({
+        concern: trimmed,
+        recentPeople: history.map((item) => item.story.personName).slice(0, 8)
       });
-      const payload = await response.json();
 
-      if (!response.ok) {
-        setCrisisDetected(Boolean(payload.crisisDetected));
-        throw new Error(payload.error ?? '暂时没有找到足够可靠的相似故事。');
-      }
-
-      const data = payload as MatchResponse;
       setResult(data.story);
       setCrisisDetected(data.crisisDetected);
       const nextHistory = [
@@ -79,7 +83,10 @@ function App() {
       setHistory(nextHistory);
       writeHistory(nextHistory);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '服务暂时不可用。');
+      if (caught instanceof MatchRequestError) {
+        setCrisisDetected(caught.crisisDetected);
+      }
+      setError(caught instanceof Error ? caught.message : '服务暂时不可用，请稍后再试。');
     } finally {
       setLoading(false);
     }
@@ -236,6 +243,88 @@ function readHistory(): HistoryItem[] {
 
 function writeHistory(items: HistoryItem[]) {
   localStorage.setItem(HISTORY_KEY, JSON.stringify(items));
+}
+
+class MatchRequestError extends Error {
+  readonly crisisDetected: boolean;
+
+  constructor(message: string, crisisDetected = false) {
+    super(message);
+    this.name = 'MatchRequestError';
+    this.crisisDetected = crisisDetected;
+  }
+}
+
+async function requestMatchStory(body: { concern: string; recentPeople: string[] }): Promise<MatchResponse> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), MATCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch('/api/match-story', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const payload = await parseApiPayload(response);
+
+    if (!response.ok) {
+      throw new MatchRequestError(getFriendlyErrorMessage(response.status, payload), Boolean(payload.crisisDetected));
+    }
+
+    if (!isMatchResponse(payload)) {
+      throw new MatchRequestError('服务返回格式异常，请稍后再试。');
+    }
+
+    return payload;
+  } catch (caught) {
+    if (caught instanceof MatchRequestError) {
+      throw caught;
+    }
+    if (caught instanceof DOMException && caught.name === 'AbortError') {
+      throw new MatchRequestError('这次匹配耗时过久，请稍后再试。');
+    }
+    throw new MatchRequestError('服务连接中断，请稍后再试。');
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function parseApiPayload(response: Response): Promise<ApiErrorResponse | MatchResponse> {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.includes('application/json')) {
+    return await response.json() as ApiErrorResponse | MatchResponse;
+  }
+
+  const text = await response.text();
+  return {
+    error: text.trim().slice(0, 180)
+  };
+}
+
+function isMatchResponse(value: ApiErrorResponse | MatchResponse): value is MatchResponse {
+  return typeof (value as MatchResponse).story === 'object'
+    && (value as MatchResponse).story !== null
+    && typeof (value as MatchResponse).crisisDetected === 'boolean';
+}
+
+function getFriendlyErrorMessage(status: number, payload: ApiErrorResponse) {
+  if (payload.code === 'CONFIG_MISSING') {
+    return payload.error ?? '服务缺少必要配置，请检查部署环境变量。';
+  }
+  if (payload.code === 'UPSTREAM_TIMEOUT' || status === 504) {
+    return payload.error ?? '外部服务响应超时，请稍后再试。';
+  }
+  if (payload.code === 'UPSTREAM_ERROR' || status === 502) {
+    return payload.error ?? '外部服务暂时不可用，请稍后再试。';
+  }
+  if (payload.code === 'NO_RELIABLE_SOURCE' || status === 424) {
+    return payload.error ?? '暂时没有找到足够可靠的原文材料。';
+  }
+  if (payload.code === 'BAD_REQUEST' || status === 400) {
+    return payload.error ?? '输入内容无效，请调整后再试。';
+  }
+  return payload.error || '服务暂时不可用，请稍后再试。';
 }
 
 function formatDate(value: string) {

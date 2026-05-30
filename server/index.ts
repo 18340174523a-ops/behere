@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -68,10 +69,15 @@ type AiMessage = {
   content: string;
 };
 
+type ErrorCode = 'CONFIG_MISSING' | 'UPSTREAM_ERROR' | 'UPSTREAM_TIMEOUT' | 'NO_RELIABLE_SOURCE' | 'BAD_REQUEST';
+
+type RequestLogger = (stage: string, details?: Record<string, unknown>) => void;
+
 const crisisPattern = /(自杀|轻生|不想活|结束生命|伤害自己|自残|活不下去|suicide|kill myself|self-harm)/i;
 const reliableMinimum = 2;
 const AI_TIMEOUT_MS = 12000;
 const TAVILY_TIMEOUT_MS = 10000;
+const MATCH_SOURCE_LIMIT = 8;
 
 const famousSeedLibrary: Record<string, string[]> = {
   job_rejection: ['J.K. Rowling', 'Steve Jobs', 'Oprah Winfrey', 'Walt Disney', 'Abraham Lincoln', '俞敏洪', '马云', '李安'],
@@ -108,46 +114,82 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.post('/api/match-story', async (req, res) => {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  const log = createRequestLogger(requestId);
+
   const parsed = MatchRequestSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message ?? '输入内容无效。' });
+    const error = parsed.error.issues[0]?.message ?? '输入内容无效。';
+    log('bad_request', { error });
+    res.status(400).json({ error, code: 'BAD_REQUEST' satisfies ErrorCode, requestId });
     return;
   }
 
   const concern = parsed.data.concern;
   const recentPeople = parsed.data.recentPeople;
   const crisisDetected = crisisPattern.test(concern);
+  log('start', { concernLength: concern.length, recentPeopleCount: recentPeople.length, crisisDetected });
 
   try {
+    log('env_check');
     assertEnv();
-    const analysis = await analyzeConcernForSearch(concern);
+
+    log('analysis_start');
+    const analysis = await analyzeConcernForSearch(concern, log);
+    log('analysis_done', { caseType: analysis.caseType, candidates: analysis.famousCandidates.length });
+
+    log('search_start');
     const searchResults = await searchPublicStories(concern, analysis);
-    const rankedResults = rankSearchResults(searchResults, analysis, recentPeople).slice(0, 16);
-    const reliableResults = await evaluateCandidatesWithAi(concern, analysis, rankedResults);
+    log('search_done', { results: searchResults.length });
+
+    const rankedResults = rankSearchResults(searchResults, analysis, recentPeople).slice(0, 12);
+    log('rank_done', { rankedResults: rankedResults.length });
+
+    const reliableResults = await evaluateCandidatesWithAi(concern, analysis, rankedResults, log);
+    log('evaluation_done', { reliableResults: reliableResults.length });
 
     if (reliableResults.length < reliableMinimum) {
+      log('no_reliable_source', { reliableResults: reliableResults.length });
       res.status(424).json({
         error: '暂时没有找到足够可靠的原文材料。',
+        code: 'NO_RELIABLE_SOURCE' satisfies ErrorCode,
+        requestId,
         crisisDetected
       });
       return;
     }
 
-    const story = await findVerifiedQuote(concern, reliableResults, analysis);
+    log('quote_match_start');
+    const story = await findVerifiedQuote(concern, reliableResults.slice(0, MATCH_SOURCE_LIMIT), analysis, log);
 
     if (!story) {
+      log('quote_match_failed');
       res.status(424).json({
         error: '暂时没有找到足够可靠的原文材料。',
+        code: 'NO_RELIABLE_SOURCE' satisfies ErrorCode,
+        requestId,
         crisisDetected
       });
       return;
     }
 
-    res.json({ story, crisisDetected });
+    log('success', { elapsedMs: Date.now() - startedAt, sourceUrl: story.sourceUrl });
+    res.json({ story, crisisDetected, requestId });
   } catch (error) {
-    const message = getPublicErrorMessage(error);
-    const status = message.includes('环境变量') ? 500 : 502;
-    res.status(status).json({ error: message, crisisDetected });
+    const publicError = getPublicError(error);
+    log('failed', {
+      elapsedMs: Date.now() - startedAt,
+      code: publicError.code,
+      status: publicError.status,
+      message: error instanceof Error ? error.message : String(error)
+    });
+    res.status(publicError.status).json({
+      error: publicError.message,
+      code: publicError.code,
+      requestId,
+      crisisDetected
+    });
   }
 });
 
@@ -162,14 +204,37 @@ app.listen(PORT, () => {
   console.log(`Story matcher API listening on http://localhost:${PORT}`);
 });
 
-function assertEnv() {
-  const missing = ['TAVILY_API_KEY', 'AI_BASE_URL', 'AI_API_KEY', 'AI_MODEL'].filter((name) => !process.env[name]);
-  if (missing.length > 0) {
-    throw new Error(`缺少环境变量：${missing.join(', ')}。请参考 .env.example 配置。`);
+class AppError extends Error {
+  readonly code: ErrorCode;
+  readonly status: number;
+
+  constructor(code: ErrorCode, status: number, message: string, cause?: unknown) {
+    super(message);
+    this.name = 'AppError';
+    this.code = code;
+    this.status = status;
+    this.cause = cause;
   }
 }
 
-async function analyzeConcernForSearch(concern: string): Promise<SearchAnalysis> {
+function createRequestLogger(requestId: string): RequestLogger {
+  return (stage, details = {}) => {
+    console.log(JSON.stringify({
+      requestId,
+      stage,
+      ...details
+    }));
+  };
+}
+
+function assertEnv() {
+  const missing = ['TAVILY_API_KEY', 'AI_BASE_URL', 'AI_API_KEY', 'AI_MODEL'].filter((name) => !process.env[name]);
+  if (missing.length > 0) {
+    throw new AppError('CONFIG_MISSING', 500, `缺少环境变量：${missing.join(', ')}。请参考 .env.example 配置。`);
+  }
+}
+
+async function analyzeConcernForSearch(concern: string, log?: RequestLogger): Promise<SearchAnalysis> {
   const fallback = buildFallbackAnalysis(concern);
   const prompt = `
 请分析用户输入，并为 Tavily 搜索生成高质量查询。用户输入：
@@ -194,7 +259,8 @@ ${concern}
     ], 0.2);
     const parsed = SearchAnalysisSchema.safeParse(json);
     return parsed.success ? mergeAnalysisWithSeeds(parsed.data) : fallback;
-  } catch {
+  } catch (error) {
+    log?.('analysis_fallback', { reason: error instanceof Error ? error.message : String(error) });
     return fallback;
   }
 }
@@ -202,10 +268,13 @@ ${concern}
 async function searchPublicStories(concern: string, analysis: SearchAnalysis): Promise<SearchResult[]> {
   const rounds = buildSearchRounds(concern, analysis);
   const collected = new Map<string, SearchResult>();
+  let upstreamFailures = 0;
 
   for (const round of rounds) {
     const responses = await Promise.allSettled(round.map((request) => tavilySearch(request.query, request.channel)));
     const successfulResults = responses.flatMap((response) => response.status === 'fulfilled' ? response.value : []);
+    upstreamFailures += responses.filter((response) => response.status === 'rejected').length;
+
     for (const result of successfulResults) {
       if (!result.url) continue;
       const key = normalizeUrl(result.url);
@@ -219,6 +288,10 @@ async function searchPublicStories(concern: string, analysis: SearchAnalysis): P
     if (reliableCount >= 6) {
       break;
     }
+  }
+
+  if (collected.size === 0 && upstreamFailures > 0) {
+    throw new AppError('UPSTREAM_ERROR', 502, '搜索服务暂时不可用，请稍后再试。');
   }
 
   return Array.from(collected.values());
@@ -243,7 +316,7 @@ async function tavilySearch(query: string, channel: SearchResult['channel']): Pr
   }, TAVILY_TIMEOUT_MS);
 
   if (!response.ok) {
-    throw new Error(`搜索服务返回异常：${response.status}`);
+    throw new AppError('UPSTREAM_ERROR', 502, `搜索服务返回异常：${response.status}`);
   }
 
   const payload = await response.json() as { results?: SearchResult[] };
@@ -313,7 +386,7 @@ function getSeedPeople(caseType: string) {
 
 function buildSearchRounds(concern: string, analysis: SearchAnalysis) {
   const topic = getCaseTopic(analysis.caseType);
-  const people = rotateByDate(analysis.famousCandidates).slice(0, 6);
+  const people = rotateByDate(analysis.famousCandidates).slice(0, 5);
   const famousQueries = people.map((person) => ({
     query: `${person} ${topic} interview quote biography original text 采访 原文 传记`,
     channel: 'famous' as const
@@ -322,11 +395,11 @@ function buildSearchRounds(concern: string, analysis: SearchAnalysis) {
   return [
     [
       { query: analysis.primaryQuery, channel: 'semantic' as const },
-      ...famousQueries.slice(0, 2)
+      ...famousQueries.slice(0, 1)
     ],
     [
-      ...analysis.fallbackQueries.slice(0, 2).map((query) => ({ query, channel: 'fallback' as const })),
-      ...famousQueries.slice(2, 4)
+      ...analysis.fallbackQueries.slice(0, 1).map((query) => ({ query, channel: 'fallback' as const })),
+      ...famousQueries.slice(1, 3)
     ]
   ];
 }
@@ -338,13 +411,19 @@ function rankSearchResults(results: SearchResult[], analysis: SearchAnalysis, re
     .sort((a, b) => scoreSearchResult(b, famousNames, recentPeople) - scoreSearchResult(a, famousNames, recentPeople));
 }
 
-async function evaluateCandidatesWithAi(concern: string, analysis: SearchAnalysis, rankedResults: SearchResult[]) {
-  const candidates = rankedResults.slice(0, 5);
-  if (candidates.length < reliableMinimum) {
+async function evaluateCandidatesWithAi(
+  concern: string,
+  analysis: SearchAnalysis,
+  rankedResults: SearchResult[],
+  log?: RequestLogger
+) {
+  const candidates = rankedResults.slice(0, 3);
+  if (candidates.length < reliableMinimum || rankedResults.length < 4) {
     return rankedResults;
   }
 
   try {
+    log?.('candidate_ai_evaluation_start', { candidates: candidates.length });
     const prompt = buildCandidateEvaluationPrompt(concern, analysis, candidates);
     const json = await callJsonAi([
       {
@@ -369,7 +448,8 @@ async function evaluateCandidatesWithAi(concern: string, analysis: SearchAnalysi
     }
 
     return rankedResults.slice(0, 8);
-  } catch {
+  } catch (error) {
+    log?.('candidate_ai_evaluation_skipped', { reason: error instanceof Error ? error.message : String(error) });
     return rankedResults;
   }
 }
@@ -593,12 +673,19 @@ function inferPersonName(source: SearchResult, famousNames: string[]) {
     .slice(0, 40) || '公开人物';
 }
 
-async function findVerifiedQuote(concern: string, searchResults: SearchResult[], analysis: SearchAnalysis) {
+async function findVerifiedQuote(
+  concern: string,
+  searchResults: SearchResult[],
+  analysis: SearchAnalysis,
+  log?: RequestLogger
+) {
   let candidates = [...searchResults];
 
   for (let attempt = 0; attempt < 1 && candidates.length > 0; attempt += 1) {
+    log?.('quote_ai_match_start', { attempt: attempt + 1, candidates: candidates.length });
     const story = await matchWithAi(concern, candidates);
     if (!story) {
+      log?.('quote_ai_match_empty', { attempt: attempt + 1 });
       candidates = candidates.slice(1);
       continue;
     }
@@ -610,6 +697,7 @@ async function findVerifiedQuote(concern: string, searchResults: SearchResult[],
     if (source && story.confidence >= 0.55) {
       const verifiedQuote = findOriginalQuote(story.quoteExcerpt, getSourceText(source));
       if (verifiedQuote) {
+        log?.('quote_ai_match_verified', { attempt: attempt + 1, sourceUrl: source.url });
         return {
           ...story,
           sourceTitle: source.title ?? story.sourceTitle,
@@ -626,6 +714,7 @@ async function findVerifiedQuote(concern: string, searchResults: SearchResult[],
     }
   }
 
+  log?.('quote_source_fallback_start', { sources: searchResults.length });
   return buildSourceQuoteFallback(searchResults, analysis);
 }
 
@@ -680,7 +769,7 @@ async function callJsonAi(messages: AiMessage[], temperature: number) {
   if (!response.ok) {
     const details = await response.text();
     console.error(`AI service request failed with ${response.status}: ${details}`);
-    throw new Error(`AI 服务返回异常：${response.status}`);
+    throw new AppError('UPSTREAM_ERROR', 502, `AI 服务返回异常：${response.status}`);
   }
 
   const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
@@ -744,6 +833,11 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
       ...init,
       signal: controller.signal
     });
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new AppError('UPSTREAM_TIMEOUT', 504, '外部服务响应超时，请稍后再试。', error);
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -844,18 +938,38 @@ function normalizeUrl(url?: string) {
   }
 }
 
-function getPublicErrorMessage(error: unknown) {
-  if (error instanceof Error) {
-    if (error.message.includes('环境变量')) {
-      return error.message;
-    }
-    if (error.message.startsWith('搜索服务返回异常')) {
-      return error.message;
-    }
-    if (error.message.startsWith('AI 服务返回异常')) {
-      return error.message;
-    }
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+function getPublicError(error: unknown): { status: number; code: ErrorCode; message: string } {
+  if (error instanceof AppError) {
+    return {
+      status: error.status,
+      code: error.code,
+      message: error.message
+    };
   }
 
-  return '暂时没有找到足够可靠的原文材料。';
+  if (isAbortError(error)) {
+    return {
+      status: 504,
+      code: 'UPSTREAM_TIMEOUT',
+      message: '外部服务响应超时，请稍后再试。'
+    };
+  }
+
+  if (error instanceof Error && error.message.includes('环境变量')) {
+    return {
+      status: 500,
+      code: 'CONFIG_MISSING',
+      message: error.message
+    };
+  }
+
+  return {
+    status: 502,
+    code: 'UPSTREAM_ERROR',
+    message: '外部服务暂时不可用，请稍后再试。'
+  };
 }
