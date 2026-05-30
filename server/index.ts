@@ -701,8 +701,13 @@ function buildSourceQuoteFallback(searchResults: SearchResult[], analysis: Searc
       continue;
     }
 
+    const personName = inferPersonName(source, famousNames);
+    if (!personName) {
+      continue;
+    }
+
     return {
-      personName: inferPersonName(source, famousNames),
+      personName,
       storyTitle: source.title,
       quoteExcerpt: wrapChineseQuote(quote),
       sourceTitle: source.title,
@@ -773,15 +778,79 @@ function getQuoteKeywords(caseType: string) {
 function inferPersonName(source: SearchResult, famousNames: string[]) {
   const haystack = `${source.title ?? ''} ${getSourceText(source).slice(0, 1000)}`;
   const matched = famousNames.find((name) => haystack.toLowerCase().includes(name.toLowerCase()));
-  if (matched) {
-    return matched;
+  if (matched && isCrediblePersonName(matched)) {
+    return normalizePersonName(matched);
   }
 
-  const title = source.title ?? '公开人物';
-  return title
-    .split(/[：:｜|\-–—_]/)[0]
-    .replace(/^[\s"'“”]+|[\s"'“”]+$/g, '')
-    .slice(0, 40) || '公开人物';
+  const evaluatedName = source.evaluation?.personName;
+  if (evaluatedName && isCrediblePersonName(evaluatedName)) {
+    return normalizePersonName(evaluatedName);
+  }
+
+  return null;
+}
+
+function getVerifiedPersonName(personName: string, source: SearchResult, analysis: SearchAnalysis) {
+  if (isCrediblePersonName(personName)) {
+    return normalizePersonName(personName);
+  }
+
+  if (source.evaluation?.personName && isCrediblePersonName(source.evaluation.personName)) {
+    return normalizePersonName(source.evaluation.personName);
+  }
+
+  const famousNames = uniqueStrings([...analysis.famousCandidates, ...getSeedPeople(analysis.caseType)]);
+  return inferPersonName(source, famousNames);
+}
+
+function normalizePersonName(value: string) {
+  return value
+    .replace(/^[\s"'“”《》【】]+|[\s"'“”《》【】]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isCrediblePersonName(value: string) {
+  const normalized = normalizePersonName(value);
+  if (!normalized) {
+    return false;
+  }
+
+  const lower = normalized.toLowerCase();
+  const invalidHints = [
+    '访谈',
+    '专访',
+    '新闻',
+    'the paper',
+    '澎湃',
+    '作者',
+    '作家',
+    '栏目',
+    '报道',
+    '公开人物',
+    '人物名',
+    '群体',
+    'article',
+    'interview'
+  ];
+  if (invalidHints.some((hint) => lower.includes(hint.toLowerCase()))) {
+    return false;
+  }
+
+  if (/[｜|:：\-–—_]/.test(normalized)) {
+    return false;
+  }
+
+  if (normalized.length > 40) {
+    return false;
+  }
+
+  const cjkCount = Array.from(normalized).filter((char) => /[\u3400-\u9fff]/.test(char)).length;
+  if (cjkCount > 10) {
+    return false;
+  }
+
+  return /[\p{L}]/u.test(normalized);
 }
 
 async function findVerifiedQuote(
@@ -807,10 +876,12 @@ async function findVerifiedQuote(
 
     if (source && story.confidence >= 0.55) {
       const verifiedQuote = findOriginalQuote(story.quoteExcerpt, getSourceText(source));
-      if (verifiedQuote) {
+      const personName = getVerifiedPersonName(story.personName, source, analysis);
+      if (verifiedQuote && personName) {
         log?.('quote_ai_match_verified', { attempt: attempt + 1, sourceUrl: source.url });
         return {
           ...story,
+          personName,
           sourceTitle: source.title ?? story.sourceTitle,
           sourceUrl: source.url ?? story.sourceUrl,
           quoteExcerpt: wrapChineseQuote(verifiedQuote)
@@ -897,6 +968,7 @@ function buildPrompt(concern: string, searchResults: SearchResult[]) {
     id: index + 1,
     title: item.title,
     url: item.url,
+    evaluatedPersonName: item.evaluation?.personName,
     excerpt: getSourceText(item).slice(0, 1800)
   }));
 
@@ -910,9 +982,11 @@ ${JSON.stringify(sources, null, 2)}
 请从搜索结果中选择一个最相似的公众人物真实经历。要求：
 1. 必须返回所选来源的 sourceId，并复制上面对应来源的 sourceUrl。
 2. quoteExcerpt 必须是对应 excerpt 中连续出现的逐字原文，不能总结、改写、翻译或补字。
-3. quoteExcerpt 最多 120 个中文字或 240 个英文字符，不要加引号。
-4. 如果没有合适的逐字原文，请返回 confidence 低于 0.45。
-5. 只返回 JSON，字段为 sourceId、personName、storyTitle、quoteExcerpt、sourceTitle、sourceUrl、confidence。
+3. personName 必须是具体真实人物姓名，例如“李唐”“J.K. Rowling”；不能填写栏目名、文章类型、媒体名、群体称呼或标题片段。
+4. personName 不能是“90后作家·访谈”“澎湃新闻”“The Paper”“公开人物”“作家”等泛称。
+5. quoteExcerpt 最多 120 个中文字或 240 个英文字符，不要加引号。
+6. 如果没有合适的逐字原文，或无法确认具体人物姓名，请返回 confidence 低于 0.45。
+7. 只返回 JSON，字段为 sourceId、personName、storyTitle、quoteExcerpt、sourceTitle、sourceUrl、confidence。
 `;
 }
 
