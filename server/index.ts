@@ -70,6 +70,8 @@ type AiMessage = {
 
 const crisisPattern = /(自杀|轻生|不想活|结束生命|伤害自己|自残|活不下去|suicide|kill myself|self-harm)/i;
 const reliableMinimum = 2;
+const AI_TIMEOUT_MS = 12000;
+const TAVILY_TIMEOUT_MS = 10000;
 
 const famousSeedLibrary: Record<string, string[]> = {
   job_rejection: ['J.K. Rowling', 'Steve Jobs', 'Oprah Winfrey', 'Walt Disney', 'Abraham Lincoln', '俞敏洪', '马云', '李安'],
@@ -202,8 +204,9 @@ async function searchPublicStories(concern: string, analysis: SearchAnalysis): P
   const collected = new Map<string, SearchResult>();
 
   for (const round of rounds) {
-    const responses = await Promise.all(round.map((request) => tavilySearch(request.query, request.channel)));
-    for (const result of responses.flat()) {
+    const responses = await Promise.allSettled(round.map((request) => tavilySearch(request.query, request.channel)));
+    const successfulResults = responses.flatMap((response) => response.status === 'fulfilled' ? response.value : []);
+    for (const result of successfulResults) {
       if (!result.url) continue;
       const key = normalizeUrl(result.url);
       const existing = collected.get(key);
@@ -222,7 +225,7 @@ async function searchPublicStories(concern: string, analysis: SearchAnalysis): P
 }
 
 async function tavilySearch(query: string, channel: SearchResult['channel']): Promise<SearchResult[]> {
-  const response = await fetch(TAVILY_URL, {
+  const response = await fetchWithTimeout(TAVILY_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -234,10 +237,10 @@ async function tavilySearch(query: string, channel: SearchResult['channel']): Pr
       include_answer: false,
       include_raw_content: true,
       chunks_per_source: 3,
-      max_results: 20,
+      max_results: 8,
       topic: 'general'
     })
-  });
+  }, TAVILY_TIMEOUT_MS);
 
   if (!response.ok) {
     throw new Error(`搜索服务返回异常：${response.status}`);
@@ -319,16 +322,11 @@ function buildSearchRounds(concern: string, analysis: SearchAnalysis) {
   return [
     [
       { query: analysis.primaryQuery, channel: 'semantic' as const },
-      ...famousQueries.slice(0, 3)
+      ...famousQueries.slice(0, 2)
     ],
     [
-      ...analysis.fallbackQueries.slice(0, 3).map((query) => ({ query, channel: 'fallback' as const })),
-      ...famousQueries.slice(3, 6)
-    ],
-    [
-      { query: `${concern.slice(0, 80)} 知名人物 低谷 挫折 采访 原文`, channel: 'fallback' as const },
-      { query: `famous public figure ${topic} setback failure interview quote biography`, channel: 'fallback' as const },
-      { query: `well known people ${topic} original interview quote`, channel: 'fallback' as const }
+      ...analysis.fallbackQueries.slice(0, 2).map((query) => ({ query, channel: 'fallback' as const })),
+      ...famousQueries.slice(2, 4)
     ]
   ];
 }
@@ -341,7 +339,7 @@ function rankSearchResults(results: SearchResult[], analysis: SearchAnalysis, re
 }
 
 async function evaluateCandidatesWithAi(concern: string, analysis: SearchAnalysis, rankedResults: SearchResult[]) {
-  const candidates = rankedResults.slice(0, 12);
+  const candidates = rankedResults.slice(0, 5);
   if (candidates.length < reliableMinimum) {
     return rankedResults;
   }
@@ -598,7 +596,7 @@ function inferPersonName(source: SearchResult, famousNames: string[]) {
 async function findVerifiedQuote(concern: string, searchResults: SearchResult[], analysis: SearchAnalysis) {
   let candidates = [...searchResults];
 
-  for (let attempt = 0; attempt < 3 && candidates.length > 0; attempt += 1) {
+  for (let attempt = 0; attempt < 1 && candidates.length > 0; attempt += 1) {
     const story = await matchWithAi(concern, candidates);
     if (!story) {
       candidates = candidates.slice(1);
@@ -633,16 +631,20 @@ async function findVerifiedQuote(concern: string, searchResults: SearchResult[],
 
 async function matchWithAi(concern: string, searchResults: SearchResult[]) {
   const prompt = buildPrompt(concern, searchResults);
-  const json = await callJsonAi([
-    {
-      role: 'system',
-      content: '你是一个严谨的中文传记原文检索助手。只能从提供的来源文本中逐字摘录，不得总结、改写、翻译、补写或编造。'
-    },
-    { role: 'user', content: prompt }
-  ], 0.2);
+  try {
+    const json = await callJsonAi([
+      {
+        role: 'system',
+        content: '你是一个严谨的中文传记原文检索助手。只能从提供的来源文本中逐字摘录，不得总结、改写、翻译、补写或编造。'
+      },
+      { role: 'user', content: prompt }
+    ], 0.2);
 
-  const parsed = StoryResultSchema.safeParse(json);
-  return parsed.success ? parsed.data : null;
+    const parsed = StoryResultSchema.safeParse(json);
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
 }
 
 async function callJsonAi(messages: AiMessage[], temperature: number) {
@@ -652,27 +654,27 @@ async function callJsonAi(messages: AiMessage[], temperature: number) {
     response_format: { type: 'json_object' },
     messages
   };
-  let response = await fetch(`${process.env.AI_BASE_URL?.replace(/\/$/, '')}/chat/completions`, {
+  let response = await fetchWithTimeout(`${process.env.AI_BASE_URL?.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${process.env.AI_API_KEY}`
     },
     body: JSON.stringify(requestBody)
-  });
+  }, AI_TIMEOUT_MS);
 
   if (response.status === 400) {
     const details = await response.text();
     console.error(`AI JSON mode request failed with 400: ${details}`);
     const { response_format: _responseFormat, ...compatibleBody } = requestBody;
-    response = await fetch(`${process.env.AI_BASE_URL?.replace(/\/$/, '')}/chat/completions`, {
+    response = await fetchWithTimeout(`${process.env.AI_BASE_URL?.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${process.env.AI_API_KEY}`
       },
       body: JSON.stringify(compatibleBody)
-    });
+    }, AI_TIMEOUT_MS);
   }
 
   if (!response.ok) {
@@ -730,6 +732,20 @@ function parseJsonObject(content: string) {
       return JSON.parse(withoutFence.slice(start, end + 1)) as unknown;
     }
     return null;
+  }
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
