@@ -9,7 +9,7 @@
     "dev:server": "tsx watch server/index.ts",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "start": "node dist-server/index.js",
+    "start": "node dist-server/server/index.js",
     "check": "tsc -b"
   },
   "dependencies": {

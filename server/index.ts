@@ -1,9 +1,15 @@
 import 'dotenv/config';
 import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const TAVILY_URL = 'https://api.tavily.com/search';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const isProduction = process.env.NODE_ENV === 'production';
+const clientDistPath = path.resolve(__dirname, '../../dist');
 
 const MatchRequestSchema = z.object({
   concern: z.string().trim().min(12, '请多写一点你的处境，至少 12 个字。').max(2000, '内容过长，请控制在 2000 字以内。'),
@@ -142,6 +148,13 @@ app.post('/api/match-story', async (req, res) => {
     res.status(status).json({ error: message, crisisDetected });
   }
 });
+
+if (isProduction) {
+  app.use(express.static(clientDistPath));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(clientDistPath, 'index.html'));
+  });
+}
 
 app.listen(PORT, () => {
   console.log(`Story matcher API listening on http://localhost:${PORT}`);

@@ -32,6 +32,41 @@ npm run dev
 
 电脑访问 `http://localhost:5173`。手机和电脑在同一网络时，手机访问电脑的局域网 IP 加端口 `5173`。
 
+## Render 部署
+
+这个项目可以作为一个 Render Web Service 部署。Express 后端会同时提供 API 和前端静态页面。
+
+1. 把代码推送到 GitHub 仓库。
+2. 打开 Render，选择 New Web Service。
+3. 连接 GitHub 仓库。
+4. 使用仓库里的 `render.yaml`，或手动填写：
+
+```bash
+Build Command: npm install && npm run build
+Start Command: npm run start
+```
+
+5. 在 Render 的 Environment 中添加：
+
+```bash
+NODE_ENV=production
+TAVILY_API_KEY=你的 Tavily key
+AI_BASE_URL=https://api.deepseek.com
+AI_API_KEY=你的 AI key
+AI_MODEL=deepseek-chat
+```
+
+不要把真实 key 写进代码或提交到 GitHub。部署成功后，Render 会提供一个公开链接，任何人都可以访问。
+
+## 生产本地检查
+
+```bash
+npm run build
+NODE_ENV=production npm run start
+```
+
+启动后访问 `http://localhost:8787` 和 `http://localhost:8787/api/health`。
+
 ## 行为边界
 
 - 历史记录只保存在当前浏览器的 `localStorage`。
