@@ -36,7 +36,7 @@ type HistoryItem = {
 
 const HISTORY_KEY = 'resonant-stories-history';
 const EXAMPLE_TEXT = '最近我觉得自己很努力却一直没有进展，看到别人都往前走，我开始怀疑是不是自己根本不适合现在做的事。';
-const MATCH_TIMEOUT_MS = 35000;
+const MATCH_TIMEOUT_MS = 90000;
 
 function App() {
   const [concern, setConcern] = React.useState('');
@@ -150,7 +150,7 @@ function App() {
           {loading && (
             <div className="emptyState">
               <Loader2 className="spin" size={26} />
-              <p>正在检索公开资料，并核对原文出处。</p>
+              <p>正在检索公开资料并核对原文，严格匹配可能需要 1 分钟左右。</p>
             </div>
           )}
           {!loading && !result && !error && (
