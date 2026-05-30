@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.0.0"
+  },
   "scripts": {
     "dev": "concurrently \"npm:dev:client\" \"npm:dev:server\"",
     "dev:client": "vite --host 0.0.0.0",
@@ -28,7 +32,7 @@
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
+    "typescript": "5.7.2",
     "vite": "^6.0.7"
   }
 }

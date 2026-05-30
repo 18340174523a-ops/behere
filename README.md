@@ -49,6 +49,7 @@ Start Command: npm run start
 5. 在 Render 的 Environment 中添加：
 
 ```bash
+NODE_VERSION=22.12.0
 NODE_ENV=production
 TAVILY_API_KEY=你的 Tavily key
 AI_BASE_URL=https://api.deepseek.com
