@@ -646,21 +646,38 @@ async function matchWithAi(concern: string, searchResults: SearchResult[]) {
 }
 
 async function callJsonAi(messages: AiMessage[], temperature: number) {
-  const response = await fetch(`${process.env.AI_BASE_URL?.replace(/\/$/, '')}/chat/completions`, {
+  const requestBody = {
+    model: process.env.AI_MODEL,
+    temperature,
+    response_format: { type: 'json_object' },
+    messages
+  };
+  let response = await fetch(`${process.env.AI_BASE_URL?.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${process.env.AI_API_KEY}`
     },
-    body: JSON.stringify({
-      model: process.env.AI_MODEL,
-      temperature,
-      response_format: { type: 'json_object' },
-      messages
-    })
+    body: JSON.stringify(requestBody)
   });
 
+  if (response.status === 400) {
+    const details = await response.text();
+    console.error(`AI JSON mode request failed with 400: ${details}`);
+    const { response_format: _responseFormat, ...compatibleBody } = requestBody;
+    response = await fetch(`${process.env.AI_BASE_URL?.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.AI_API_KEY}`
+      },
+      body: JSON.stringify(compatibleBody)
+    });
+  }
+
   if (!response.ok) {
+    const details = await response.text();
+    console.error(`AI service request failed with ${response.status}: ${details}`);
     throw new Error(`AI 服务返回异常：${response.status}`);
   }
 
